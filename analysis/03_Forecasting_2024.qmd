@@ -1,0 +1,351 @@
+---
+title: "2024 SKU Turnover & Sales Forecasting"
+author: "Nandni Talreja"
+format: html
+editor: visual
+---
+
+## Overview
+
+This file extends the turnover analysis to 2024 data (January–September) and adds **predictive modeling** for daily sales forecasting.
+
+Two models are built and compared:
+1. **Linear Regression** — uses lagged sales and day-of-week as features
+2. **ARIMA** — captures time-series trend and seasonality automatically
+
+The goal is to improve restocking timing by predicting demand windows.
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(ggplot2)
+library(writexl)
+library(forecast)
+```
+
+---
+
+## 1. Load 2024 Data
+
+```{r load-data, message=FALSE, warning=FALSE}
+# Combined Amazon order data for Jan–Sept 2024
+# Each row = one order line item
+amazon_data <- read_xlsx(here::here("data", "amazon_jan_to_sept_2024.xlsx"))
+
+# Inventory snapshots (from Amazon Seller Central)
+data_jan  <- read_xlsx(here::here("data", "inventory_jan.xlsx"))
+data_june <- read_csv(here::here("data",  "inventory_june.csv"))
+data_sept <- read_csv(here::here("data",  "inventory_sept.csv"))
+
+# Net proceeds data (revenue after Amazon fees)
+net_proceeds <- read_xlsx(here::here("data", "net_proceeds.xlsx"))
+
+# Product name lookup table (one row per SKU)
+product_lookup <- amazon_data %>%
+  select(sku, `product-name`) %>%
+  distinct(sku, .keep_all = TRUE)
+
+cat("Rows loaded:", nrow(amazon_data), "\n")
+cat("Unique SKUs:", n_distinct(amazon_data$sku), "\n")
+```
+
+---
+
+## 2. Aggregate Monthly Sales by SKU
+
+```{r monthly-aggregation}
+# List of monthly data sheets (loaded separately from the source file)
+# In the original data, each month was a separate sheet in amazon_2024.xlsx
+# Here we derive them from the combined file instead
+
+amazon_data <- amazon_data %>%
+  mutate(
+    `purchase-date` = as.Date(`purchase-date`),
+    Month = month(`purchase-date`, label = TRUE, abbr = TRUE),
+    Year  = year(`purchase-date`)
+  )
+
+# Aggregate units sold per SKU per month
+monthly_by_sku <- amazon_data %>%
+  filter(Year == 2024) %>%
+  group_by(sku, Month) %>%
+  summarise(sales = sum(quantity, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Month, values_from = sales, 
+              names_prefix = "sales_", values_fill = 0)
+
+# Ensure all 9 months are present even if some SKUs had zero sales
+expected_cols <- paste0("sales_", c("Jan","Feb","Mar","Apr","May",
+                                     "Jun","Jul","Aug","Sep"))
+for (col in expected_cols) {
+  if (!col %in% names(monthly_by_sku)) monthly_by_sku[[col]] <- 0
+}
+
+# Calculate COGS per month (unit cost = $2.30 per pair)
+UNIT_COST <- 2.30
+
+data_2024 <- monthly_by_sku %>%
+  mutate(across(starts_with("sales_"), 
+                ~ . * UNIT_COST, 
+                .names = "cogs_{.col}")) %>%
+  rename_with(~ str_replace(., "cogs_sales_", "cogs_"), starts_with("cogs_sales_"))
+
+glimpse(data_2024)
+```
+
+---
+
+## 3. Calculate 2024 Turnover Rates
+
+```{r turnover-2024}
+# Rename inventory columns for clarity
+inv_jan  <- data_jan  %>% select(sku, available) %>% rename(inventory_jan  = available)
+inv_june <- data_june %>% select(sku, available) %>% rename(inventory_june = available)
+inv_sept <- data_sept %>% select(sku, available) %>% rename(inventory_sept = available)
+
+# Join inventory snapshots and sales data
+turnover <- inv_jan %>%
+  full_join(inv_june,  by = "sku") %>%
+  full_join(inv_sept,  by = "sku") %>%
+  full_join(data_2024, by = "sku")
+
+turnover[is.na(turnover)] <- 0
+
+# Average inventory for each window
+avg_inv_jan_june  <- (turnover$inventory_jan  + turnover$inventory_june) / 2
+avg_inv_jan_sept  <- (turnover$inventory_jan  + turnover$inventory_sept) / 2
+avg_inv_june_sept <- (turnover$inventory_june + turnover$inventory_sept) / 2
+
+# COGS per window
+cogs_jan_june <- turnover %>%
+  rowwise() %>%
+  mutate(cogs_jan_june = sum(c_across(c(cogs_Jan, cogs_Feb, cogs_Mar, 
+                                         cogs_Apr, cogs_May, cogs_Jun)))) %>%
+  select(sku, cogs_jan_june) %>% ungroup()
+
+cogs_jan_sept <- turnover %>%
+  rowwise() %>%
+  mutate(cogs_jan_sept = sum(c_across(starts_with("cogs_")))) %>%
+  select(sku, cogs_jan_sept) %>% ungroup()
+
+cogs_june_sept <- turnover %>%
+  rowwise() %>%
+  mutate(cogs_june_sept = sum(c_across(c(cogs_Jun, cogs_Jul, 
+                                          cogs_Aug, cogs_Sep)))) %>%
+  select(sku, cogs_june_sept) %>% ungroup()
+
+turnover <- turnover %>%
+  full_join(cogs_jan_june,  by = "sku") %>%
+  full_join(cogs_jan_sept,  by = "sku") %>%
+  full_join(cogs_june_sept, by = "sku")
+
+# Total sales per window
+turnover <- turnover %>%
+  mutate(
+    total_sales_jan_june  = sales_Jan + sales_Feb + sales_Mar + 
+                            sales_Apr + sales_May + sales_Jun,
+    total_sales_jan_sept  = total_sales_jan_june + 
+                            sales_Jul + sales_Aug + sales_Sep,
+    total_sales_june_sept = sales_Jun + sales_Jul + sales_Aug + sales_Sep
+  )
+
+# Guard against divide-by-zero
+turnover <- turnover %>%
+  mutate(
+    avg_inv_jan_june  = ifelse(avg_inv_jan_june  == 0, 1, avg_inv_jan_june),
+    avg_inv_jan_sept  = ifelse(avg_inv_jan_sept  == 0, 1, avg_inv_jan_sept),
+    avg_inv_june_sept = ifelse(avg_inv_june_sept == 0, 1, avg_inv_june_sept),
+    # Overall average inventory across all three windows
+    avg_inventory = (avg_inv_jan_june + avg_inv_jan_sept + avg_inv_june_sept) / 3
+  )
+
+# Calculate turnover rates
+turnover <- turnover %>%
+  mutate(
+    turnover_jan_june  = total_sales_jan_june  / avg_inv_jan_june,
+    turnover_jan_sept  = total_sales_jan_sept  / avg_inv_jan_sept,
+    turnover_june_sept = total_sales_june_sept / avg_inv_june_sept
+  )
+
+# Attach net proceeds (revenue after Amazon fees)
+net_proceeds <- net_proceeds %>% rename(sku = SKU)
+
+turnover_final <- turnover %>%
+  full_join(net_proceeds,  by = "sku") %>%
+  left_join(product_lookup, by = "sku") %>%
+  relocate(`product-name`, .after = sku)
+
+# Export for stakeholders
+writexl::write_xlsx(
+  list("Turnover 2024" = turnover_final),
+  here::here("outputs", "sku_turnover_2024.xlsx")
+)
+
+cat("2024 turnover analysis exported.\n")
+```
+
+---
+
+## 4. Daily Sales Trend
+
+```{r daily-sales-plot}
+# Aggregate to daily total sales across all SKUs
+daily_sales <- amazon_data %>%
+  filter(Year == 2024) %>%
+  group_by(`purchase-date`) %>%
+  summarize(total_sales = sum(quantity, na.rm = TRUE), .groups = "drop") %>%
+  arrange(`purchase-date`)
+
+# Add time features for modeling
+daily_sales <- daily_sales %>%
+  mutate(
+    day_of_week = weekdays(`purchase-date`),
+    month       = format(`purchase-date`, "%m")
+  )
+
+# Plot overall sales trend
+ggplot(daily_sales, aes(x = `purchase-date`, y = total_sales)) +
+  geom_line(color = "#2E86AB", alpha = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "#E74C3C", 
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "Daily Amazon Sales — Jan to Sept 2024",
+    subtitle = "Red dashed line = smoothed trend",
+    x        = "Date",
+    y        = "Units Sold"
+  ) +
+  theme_minimal()
+```
+
+---
+
+## 5. Linear Regression Sales Forecast
+
+```{r linear-model}
+# Feature engineering: lagged sales capture recent momentum
+# sales_lag_1 = yesterday's sales (short-term momentum)
+# sales_lag_7 = same day last week (weekly seasonality)
+daily_sales <- daily_sales %>%
+  mutate(
+    sales_lag_1 = lag(total_sales, 1),
+    sales_lag_7 = lag(total_sales, 7)
+  ) %>%
+  drop_na()  # Remove rows with NAs from lag creation
+
+# 80/20 train/test split (chronological — important for time series)
+set.seed(123)
+train_size <- floor(0.8 * nrow(daily_sales))
+train_data <- daily_sales[1:train_size, ]
+test_data  <- daily_sales[(train_size + 1):nrow(daily_sales), ]
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Test rows:", nrow(test_data), "\n")
+
+# Fit linear regression model
+lm_model <- lm(total_sales ~ sales_lag_1 + sales_lag_7 + day_of_week, 
+               data = train_data)
+
+summary(lm_model)
+```
+
+```{r lm-evaluation}
+# Generate predictions on holdout test set
+lm_predictions <- predict(lm_model, test_data)
+
+# Evaluation metrics
+mae_lm  <- mean(abs(lm_predictions - test_data$total_sales))
+rmse_lm <- sqrt(mean((lm_predictions - test_data$total_sales)^2))
+
+cat("Linear Regression — Test Set Performance:\n")
+cat("  MAE  (Mean Absolute Error):", round(mae_lm, 2), "units\n")
+cat("  RMSE (Root Mean Sq Error): ", round(rmse_lm, 2), "units\n")
+
+# Actual vs Predicted plot
+ggplot() +
+  geom_line(data = test_data, 
+            aes(x = `purchase-date`, y = total_sales, color = "Actual")) +
+  geom_line(aes(x = test_data$`purchase-date`, y = lm_predictions, 
+                color = "Predicted (LM)")) +
+  scale_color_manual(values = c("Actual" = "#2E86AB", 
+                                 "Predicted (LM)" = "#E74C3C")) +
+  labs(
+    title    = "Linear Regression: Actual vs. Predicted Daily Sales",
+    subtitle = paste0("Test period | MAE: ", round(mae_lm, 1), 
+                      " units | RMSE: ", round(rmse_lm, 1), " units"),
+    x        = "Date",
+    y        = "Units Sold",
+    color    = NULL
+  ) +
+  theme_minimal()
+```
+
+---
+
+## 6. ARIMA Time-Series Forecast
+
+```{r arima-model}
+# ARIMA (AutoRegressive Integrated Moving Average)
+# auto.arima() selects the best p,d,q parameters automatically
+# This model captures trend + seasonality without manual feature engineering
+
+arima_model <- auto.arima(train_data$total_sales)
+summary(arima_model)
+```
+
+```{r arima-forecast}
+# Forecast for the length of the test set
+arima_forecast <- forecast(arima_model, h = nrow(test_data))
+
+# Evaluation metrics
+mae_arima  <- mean(abs(arima_forecast$mean - test_data$total_sales))
+rmse_arima <- sqrt(mean((arima_forecast$mean - test_data$total_sales)^2))
+
+cat("ARIMA — Test Set Performance:\n")
+cat("  MAE  (Mean Absolute Error):", round(mae_arima, 2), "units\n")
+cat("  RMSE (Root Mean Sq Error): ", round(rmse_arima, 2), "units\n")
+
+# Actual vs ARIMA predicted plot
+ggplot() +
+  geom_line(data = test_data,
+            aes(x = `purchase-date`, y = total_sales, color = "Actual")) +
+  geom_line(aes(x = test_data$`purchase-date`, 
+                y = as.numeric(arima_forecast$mean),
+                color = "Predicted (ARIMA)")) +
+  scale_color_manual(values = c("Actual" = "#2E86AB", 
+                                 "Predicted (ARIMA)" = "#27AE60")) +
+  labs(
+    title    = "ARIMA: Actual vs. Predicted Daily Sales",
+    subtitle = paste0("Test period | MAE: ", round(mae_arima, 1), 
+                      " units | RMSE: ", round(rmse_arima, 1), " units"),
+    x        = "Date",
+    y        = "Units Sold",
+    color    = NULL
+  ) +
+  theme_minimal()
+```
+
+---
+
+## 7. Model Comparison
+
+```{r model-comparison}
+# Side-by-side comparison of both models
+model_comparison <- tibble(
+  Model   = c("Linear Regression", "ARIMA"),
+  MAE     = c(round(mae_lm, 2),    round(mae_arima, 2)),
+  RMSE    = c(round(rmse_lm, 2),   round(rmse_arima, 2)),
+  Notes   = c(
+    "Uses lag features + day-of-week; interpretable",
+    "Auto-selects time-series structure; no feature engineering needed"
+  )
+)
+
+model_comparison %>%
+  kable(caption = "Forecast Model Comparison — Test Set") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+**Business Implication:** Lower MAE = closer predictions = better restocking timing. Use the better-performing model to forecast demand 2–4 weeks ahead and trigger reorder alerts when predicted demand exceeds current safety stock levels.
